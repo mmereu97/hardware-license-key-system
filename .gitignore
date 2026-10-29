@@ -1,8 +1,20 @@
-.venv/
-.idea/
+# NEVER commit the vendor's private key
+vendor_private_key.pem
+*.pem
+
+# Runtime state of the protected application
+license.dat
+license.tmp
+rsa_key.dat
+
+# Build / IDE
+__pycache__/
+*.pyc
 build/
 dist/
-license.dat
-rsa_key.dat
-WordReplacer.exe
 *.spec
+*.exe
+.venv/
+venv/
+.idea/
+.vscode/

@@ -1,412 +1,218 @@
-import os
-import time
-import ntplib
-import socket
-import random
+"""Client-side license manager: what the protected application uses.
+
+    manager = SecureLicenseManager()
+    status = manager.status()            # LicenseStatus(valid, message, days_left, expires)
+    ok, message = manager.save_license(key)
+    manager.get_hardware_id()            # shown to the user, sent to the vendor
+
+Local state (license.dat) is plain JSON: the license keys themselves (signed,
+so they cannot be edited) and the last time the application saw the clock.
+An HMAC over the state makes casual edits detectable; it is not a secret
+(the key is derived from data on this machine), only a tamper seal.
+"""
+from __future__ import annotations
+
 import hashlib
-import platform
+import hmac
 import json
-import uuid
-import base64
-import wmi
-from typing import Dict, Tuple, Optional
-from datetime import datetime, timedelta
-from cryptography.hazmat.primitives import hashes, padding
-from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import serialization
-from cryptography.fernet import Fernet
+import os
+import random
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
 
-class EnhancedHardwareID:
-    """Hardware fingerprinting class"""
-    def __init__(self):
-        self.wmi_client = wmi.WMI()
-    
-    def get_cpu_info(self) -> str:
+from license_core import (
+    License,
+    LicenseError,
+    check_license,
+    hardware_matches,
+    load_public_key,
+    read_license,
+)
+
+CLOCK_TOLERANCE_SECONDS = 10 * 60      # how far back the clock may move (DST, sync jitter)
+NTP_TOLERANCE_SECONDS = 5 * 60
+NTP_SERVERS = ["pool.ntp.org", "time.google.com", "time.windows.com", "time.cloudflare.com"]
+
+
+@dataclass(frozen=True)
+class LicenseStatus:
+    valid: bool
+    message: str
+    days_left: int = 0
+    expires: Optional[date] = None
+
+
+def app_dir() -> Path:
+    """Folder of the running application (the .exe when frozen with PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def ntp_offset_seconds(timeout: float = 2.0) -> Optional[float]:
+    """Local clock minus internet time, or None when offline."""
+    try:
+        import ntplib
+    except ImportError:
+        return None
+    client = ntplib.NTPClient()
+    for server in random.sample(NTP_SERVERS, 2):
         try:
-            cpu_info = self.wmi_client.Win32_Processor()[0]
-            return f"{cpu_info.ProcessorId}:{cpu_info.Name}:{cpu_info.NumberOfCores}"
+            return -client.request(server, version=3, timeout=timeout).offset
         except Exception:
-            return ""
+            continue
+    return None
 
-    def get_bios_info(self) -> str:
-        try:
-            bios = self.wmi_client.Win32_BIOS()[0]
-            return f"{bios.Manufacturer}:{bios.SerialNumber}:{bios.Version}"
-        except Exception:
-            return ""
-
-    def get_baseboard_info(self) -> str:
-        try:
-            board = self.wmi_client.Win32_BaseBoard()[0]
-            return f"{board.Manufacturer}:{board.Product}:{board.SerialNumber}"
-        except Exception:
-            return ""
-
-    def get_disk_info(self) -> str:
-        try:
-            disks = self.wmi_client.Win32_DiskDrive()
-            system_disk = next((disk for disk in disks if disk.Index == 0), None)
-            if system_disk:
-                return f"{system_disk.Model}:{system_disk.SerialNumber}"
-            return ""
-        except Exception:
-            return ""
-
-    def get_mac_address(self) -> str:
-        try:
-            mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff)
-                           for elements in range(0,8*6,8)][::-1])
-            return mac
-        except Exception:
-            return ""
-
-    def generate_hardware_fingerprint(self) -> Dict[str, str]:
-        fingerprint = {
-            'cpu': self.get_cpu_info(),
-            'bios': self.get_bios_info(),
-            'board': self.get_baseboard_info(),
-            'disk': self.get_disk_info(),
-            'mac': self.get_mac_address(),
-            'os': platform.platform()
-        }
-        return fingerprint
-
-    def calculate_hardware_id(self) -> str:
-        fingerprint = self.generate_hardware_fingerprint()
-        combined_info = '|'.join([
-            str(fingerprint.get('cpu', '')),
-            str(fingerprint.get('bios', '')),
-            str(fingerprint.get('board', '')),
-            str(fingerprint.get('disk', '')),
-            str(fingerprint.get('mac', '')),
-            str(fingerprint.get('os', ''))
-        ])
-        return hashlib.sha256(combined_info.encode()).hexdigest()[:32]
-
-class SecurityModule:
-    """Core security functionality"""
-    def __init__(self):
-        self.ntp_servers = [
-            'pool.ntp.org',
-            'time.google.com',
-            'time.windows.com',
-            'time.apple.com'
-        ]
-        self.time_threshold = 300  # 5 minute tolerance
-        self.key_file = "rsa_key.dat"  # Fișier pentru a stoca cheia RSA
-        self.rsa_key = self._load_or_generate_rsa_key()
-        self.device_key = self._generate_device_specific_key()
-    
-    def _load_or_generate_rsa_key(self) -> rsa.RSAPrivateKey:
-        """Încarcă cheia RSA dacă există, altfel generează una nouă și o salvează"""
-        try:
-            if os.path.exists(self.key_file):
-                # Deschidem fișierul cu cheia RSA salvată
-                with open(self.key_file, "rb") as f:
-                    key_bytes = f.read()
-                
-                # Deserializăm cheia RSA
-                private_key = serialization.load_der_private_key(
-                    key_bytes,
-                    password=None
-                )
-                return private_key
-            
-            # Dacă fișierul nu există, generăm o cheie nouă
-            return self._generate_and_save_rsa_key()
-        except Exception:
-            # În caz de eroare, generăm o cheie nouă
-            if os.path.exists(self.key_file):
-                # Încercăm să ștergem fișierul vechi în caz de corupere
-                try:
-                    os.remove(self.key_file)
-                except:
-                    pass
-            return self._generate_and_save_rsa_key()
-    
-    def _generate_and_save_rsa_key(self) -> rsa.RSAPrivateKey:
-        """Generează o cheie RSA nouă și o salvează în fișier"""
-        # Generăm cheia
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048
-        )
-        
-        # Serializăm cheia în format DER (mai compact decât PEM)
-        key_bytes = private_key.private_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        
-        # Salvăm cheia în fișier
-        with open(self.key_file, "wb") as f:
-            f.write(key_bytes)
-        
-        return private_key
-    
-    def _generate_device_specific_key(self) -> bytes:
-        device_info = [
-            platform.machine(),
-            platform.processor(),
-            platform.node(),
-            str(self._get_disk_serial()),
-            str(self._get_cpu_info()),
-            platform.platform()
-        ]
-        combined = ":".join(filter(None, device_info))
-        return hashlib.sha256(combined.encode()).digest()
-
-    def _get_disk_serial(self) -> str:
-        try:
-            if platform.system() == "Windows":
-                c = wmi.WMI()
-                for disk in c.Win32_DiskDrive():
-                    return disk.SerialNumber.strip()
-            return ""
-        except:
-            return ""
-
-    def _get_cpu_info(self) -> str:
-        try:
-            if platform.system() == "Windows":
-                c = wmi.WMI()
-                for cpu in c.Win32_Processor():
-                    return cpu.ProcessorId.strip()
-            return ""
-        except:
-            return ""
-
-    def verify_time(self) -> Tuple[bool, str]:
-        for server in random.sample(self.ntp_servers, 2):
-            try:
-                ntp_client = ntplib.NTPClient()
-                response = ntp_client.request(server)
-                ntp_time = datetime.fromtimestamp(response.tx_time)
-                local_time = datetime.now()
-                
-                time_diff = abs((ntp_time - local_time).total_seconds())
-                
-                if time_diff > self.time_threshold:
-                    return False, "System time manipulation detected"
-                
-                return True, "Time verification successful"
-            except:
-                continue
-        return False, "Could not verify time"
-
-    def encrypt_license_data(self, data: dict) -> Tuple[bytes, bytes]:
-        # Generate a random AES key
-        aes_key = os.urandom(32)
-        iv = os.urandom(16)
-        
-        # Create AES cipher
-        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
-        encryptor = cipher.encryptor()
-        
-        # Pad and encrypt data
-        padder = padding.PKCS7(algorithms.AES.block_size).padder()
-        data_bytes = str(data).encode()
-        padded_data = padder.update(data_bytes) + padder.finalize()
-        encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-        
-        # Combine IV and encrypted data
-        final_data = iv + encrypted_data
-        
-        # Encrypt AES key with RSA
-        encrypted_key = self.rsa_key.public_key().encrypt(
-            aes_key,
-            asym_padding.OAEP(
-                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        
-        # XOR with device-specific key
-        device_encrypted_data = self._xor_with_device_key(final_data)
-        
-        return device_encrypted_data, encrypted_key
-
-    def decrypt_license_data(self, encrypted_data: bytes, encrypted_key: bytes) -> dict:
-        try:
-            # Decrypt AES key with RSA
-            aes_key = self.rsa_key.decrypt(
-                encrypted_key,
-                asym_padding.OAEP(
-                    mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
-            )
-            
-            # XOR with device-specific key
-            decrypted_data = self._xor_with_device_key(encrypted_data)
-            
-            # Separate IV and data
-            iv = decrypted_data[:16]
-            cipher_text = decrypted_data[16:]
-            
-            # Create AES cipher
-            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv))
-            decryptor = cipher.decryptor()
-            
-            # Decrypt data
-            padded_data = decryptor.update(cipher_text) + decryptor.finalize()
-            
-            # Remove padding
-            unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
-            data = unpadder.update(padded_data) + unpadder.finalize()
-            
-            return eval(data.decode())
-        except Exception as e:
-            raise Exception(f"Decryption failed: {str(e)}")
-
-    def _xor_with_device_key(self, data: bytes) -> bytes:
-        if not data:
-            return data
-            
-        result = bytearray(len(data))
-        for i in range(len(data)):
-            result[i] = data[i] ^ self.device_key[i % len(self.device_key)]
-            
-        return bytes(result)
-
-    def obfuscate_string(self, text: str) -> str:
-        b64 = base64.b64encode(text.encode()).decode()
-        noise = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=8))
-        return f"{noise}{b64}{noise[::-1]}"
-
-    def deobfuscate_string(self, obfuscated: str) -> str:
-        try:
-            b64_str = obfuscated[8:-8]
-            return base64.b64decode(b64_str).decode()
-        except:
-            return ""
 
 class SecureLicenseManager:
-    """License management class"""
-    def __init__(self):
-        self.license_file = "license.dat"
-        self.hardware_id = EnhancedHardwareID()
-        self.security = SecurityModule()
-        
-    def save_license(self, license_key: str) -> Tuple[bool, str]:
-        time_valid, time_message = self.security.verify_time()
-        if not time_valid:
-            return False, f"Time verification failed: {time_message}"
+    def __init__(
+        self,
+        license_file: Optional[str] = None,
+        public_key_pem: Optional[bytes] = None,
+        hardware_id: Optional[str] = None,
+        now: Callable[[], datetime] = datetime.now,
+        check_internet_time: bool = True,
+    ):
+        if public_key_pem is None:
+            from public_key import PUBLIC_KEY_PEM
+            public_key_pem = PUBLIC_KEY_PEM
+        if not public_key_pem:
+            raise RuntimeError("No public key configured: run `python generate_keys.py` first")
+        self._public_key = load_public_key(public_key_pem)
+        self._public_key_pem = public_key_pem
+        self.license_file = Path(license_file) if license_file else app_dir() / "license.dat"
+        self._hardware_id = hardware_id
+        self._now = now
+        self._check_internet_time = check_internet_time
+        self._ntp_checked_at: Optional[float] = None   # internet time is checked at most once per hour
 
-        valid, new_days = self.validate_license_key(license_key)
-        if not valid:
-            return False, "Invalid license key"
-
-        try:
-            current_days = 0
-            if os.path.exists(self.license_file):
-                is_valid, message = self.verify_license()
-                if is_valid:
-                    current_days = int(message.split(": ")[1])
-
-            license_data = {
-                'key': self.security.obfuscate_string(license_key),
-                'hwid': self.hardware_id.calculate_hardware_id(),
-                'fingerprint': self.hardware_id.generate_hardware_fingerprint(),
-                'activation_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'days_valid': current_days + new_days,
-                'last_verified': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            }
-
-            encrypted_data, encrypted_key = self.security.encrypt_license_data(license_data)
-            
-            with open(self.license_file, 'wb') as f:
-                f.write(len(encrypted_key).to_bytes(4, 'big'))
-                f.write(encrypted_key)
-                f.write(encrypted_data)
-            
-            # Verificăm că fișierul a fost creat cu succes
-            if os.path.exists(self.license_file):
-                file_size = os.path.getsize(self.license_file)
-                if file_size <= 0:
-                    return False, "License file created but is empty"
-                
-            return True, "License activated successfully"
-
-        except Exception as e:
-            return False, f"Error saving license: {str(e)}"
-
-    def verify_license(self) -> Tuple[bool, str]:
-        try:
-            # Verificăm dacă fișierul de licență există
-            if not os.path.exists(self.license_file):
-                return False, "No license found"
-
-            # Verificăm timpul sistemului
-            time_valid, time_message = self.security.verify_time()
-            if not time_valid:
-                return False, f"Time verification failed: {time_message}"
-
-            # Citim și decriptăm datele din fișierul de licență
-            with open(self.license_file, 'rb') as f:
-                key_length = int.from_bytes(f.read(4), 'big')
-                encrypted_key = f.read(key_length)
-                encrypted_data = f.read()
-
-            license_data = self.security.decrypt_license_data(encrypted_data, encrypted_key)
-            
-            # Deobfuscăm cheia
-            license_data['key'] = self.security.deobfuscate_string(license_data['key'])
-
-            # Verificăm HWID-ul
-            current_fingerprint = self.hardware_id.generate_hardware_fingerprint()
-            stored_fingerprint = license_data['fingerprint']
-            
-            matches = 0
-            for component in ['cpu', 'bios', 'board']:
-                if stored_fingerprint.get(component) == current_fingerprint.get(component):
-                    matches += 1
-            
-            if matches < 2:
-                return False, "Hardware verification failed"
-
-            # Verificăm data de expirare
-            activation_date = datetime.strptime(license_data['activation_date'], 
-                                              '%Y-%m-%d %H:%M:%S')
-            days_valid = license_data['days_valid']
-            
-            if datetime.now() - activation_date > timedelta(days=days_valid):
-                return False, "License expired"
-                
-            days_left = days_valid - (datetime.now() - activation_date).days
-            
-            # Actualizăm data ultimei verificări
-            license_data['last_verified'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Salvăm datele înapoi în fișier
-            encrypted_data, encrypted_key = self.security.encrypt_license_data(license_data)
-            with open(self.license_file, 'wb') as f:
-                f.write(len(encrypted_key).to_bytes(4, 'big'))
-                f.write(encrypted_key)
-                f.write(encrypted_data)
-            
-            return True, f"License valid. Days remaining: {days_left}"
-            
-        except Exception as e:
-            return False, f"License verification failed: {str(e)}"
-
-    def validate_license_key(self, license_key: str) -> Tuple[bool, int]:
-        try:
-            hwid = self.hardware_id.calculate_hardware_id()
-            current_date = datetime.now().strftime('%Y-%m-%d')
-            
-            for days in range(1, 366):
-                key_base = f"{hwid}:{current_date}:{days}:YourSecretKeyHere"
-                test_key = hashlib.sha256(key_base.encode()).hexdigest()[:32]
-                if test_key == license_key:
-                    return True, days
-            return False, 0
-        except:
-            return False, 0
+    # ------------------------------------------------------------ public API
 
     def get_hardware_id(self) -> str:
-        return self.hardware_id.calculate_hardware_id()
+        if self._hardware_id is None:
+            from hardware_id import current_hardware_id
+            self._hardware_id = current_hardware_id()
+        return self._hardware_id
+
+    def status(self) -> LicenseStatus:
+        now = self._now()
+        problem = self._clock_problem(now)
+        if problem:
+            return LicenseStatus(False, problem)
+
+        keys, state_ok = self._load_state()
+        if not state_ok:
+            return LicenseStatus(False, "The license file was modified: please enter your license key again")
+        if not keys:
+            return LicenseStatus(False, "No license found")
+
+        best: Optional[License] = None
+        last_error = "No valid license"
+        for key in keys:
+            try:
+                lic = read_license(key, self._public_key)
+                check_license(lic, self.get_hardware_id(), now.date())
+            except LicenseError as exc:
+                last_error = str(exc)
+                continue
+            if best is None or lic.expires > best.expires:
+                best = lic
+        if best is None:
+            return LicenseStatus(False, last_error)
+
+        self._save_state(keys, now)   # remember the clock: detects it being moved back later
+        days = best.days_left(now.date())
+        return LicenseStatus(True, f"License valid. Days remaining: {days}", days, best.expires)
+
+    def verify_license(self) -> Tuple[bool, str]:
+        """Kept for compatibility with the v1 API."""
+        s = self.status()
+        return s.valid, s.message
+
+    def save_license(self, key: str) -> Tuple[bool, str]:
+        now = self._now()
+        problem = self._clock_problem(now)
+        if problem:
+            return False, problem
+        try:
+            lic = read_license(key, self._public_key)
+            check_license(lic, self.get_hardware_id(), now.date())
+        except LicenseError as exc:
+            return False, str(exc)
+
+        keys, state_ok = self._load_state()
+        if not state_ok:
+            keys = []
+        # keep only keys that still matter: valid for this machine and not expired
+        kept: List[str] = []
+        for old in keys:
+            try:
+                old_lic = read_license(old, self._public_key)
+            except LicenseError:
+                continue
+            if (old_lic.key != lic.key and old_lic.expires > now.date()
+                    and hardware_matches(old_lic.hardware_id, self.get_hardware_id())):
+                kept.append(old)
+        self._save_state(kept + [lic.key], now)
+        return True, f"License activated. Expires on {lic.expires.isoformat()}"
+
+    # ------------------------------------------------------------ clock
+
+    def _clock_problem(self, now: datetime) -> Optional[str]:
+        last_seen = self._last_seen()
+        if last_seen is not None and now.timestamp() < last_seen - CLOCK_TOLERANCE_SECONDS:
+            return "The system clock was moved back: set the correct date and time"
+        if self._check_internet_time and (
+            self._ntp_checked_at is None or abs(now.timestamp() - self._ntp_checked_at) > 3600
+        ):
+            offset = ntp_offset_seconds()
+            if offset is not None and abs(offset) > NTP_TOLERANCE_SECONDS:
+                return "The system clock differs from internet time: set the correct date and time"
+            if offset is not None:
+                self._ntp_checked_at = now.timestamp()
+        return None
+
+    # ------------------------------------------------------------ state file
+
+    def _seal_key(self) -> bytes:
+        return hashlib.sha256(b"license-state|" + self.get_hardware_id().encode() + b"|" + self._public_key_pem).digest()
+
+    def _seal(self, keys: List[str], last_seen: float) -> str:
+        body = json.dumps({"keys": keys, "last_seen": last_seen}, sort_keys=True).encode()
+        return hmac.new(self._seal_key(), body, hashlib.sha256).hexdigest()
+
+    def _read_raw(self) -> Optional[dict]:
+        try:
+            return json.loads(self.license_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return {}
+
+    def _load_state(self) -> Tuple[List[str], bool]:
+        data = self._read_raw()
+        if data is None:
+            return [], True
+        try:
+            keys, last_seen = list(data["keys"]), float(data["last_seen"])
+            ok = hmac.compare_digest(str(data["seal"]), self._seal(keys, last_seen))
+        except (KeyError, TypeError, ValueError):
+            return [], False
+        return (keys, True) if ok else ([], False)
+
+    def _last_seen(self) -> Optional[float]:
+        data = self._read_raw()
+        try:
+            return float(data["last_seen"]) if data else None
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _save_state(self, keys: List[str], now: datetime) -> None:
+        last_seen = max(now.timestamp(), self._last_seen() or 0.0)
+        data = {"keys": keys, "last_seen": last_seen, "seal": self._seal(keys, last_seen)}
+        tmp = self.license_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(tmp, self.license_file)

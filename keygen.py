@@ -1,102 +1,133 @@
+"""Vendor tool: signs license keys with the private key.
+
+    python keygen.py
+
+Needs vendor_private_key.pem (created by generate_keys.py). Never ship this
+tool or the private key to customers.
+"""
+from __future__ import annotations
+
 import sys
-import hashlib
-from datetime import datetime, timedelta
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, 
-                            QTextEdit, QVBoxLayout, QWidget, QMessageBox, 
-                            QSpinBox, QHBoxLayout)
+from datetime import date
+from pathlib import Path
+
+from PyQt5.QtCore import QDate
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QApplication, QCheckBox, QDateEdit, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPushButton, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
+)
+
+from license_core import MAX_DAYS, LicenseError, issue_license, load_private_key, read_license
+
+PRIVATE_KEY_FILE = Path(__file__).resolve().parent / "vendor_private_key.pem"
+
+
+def load_vendor_key(parent: QWidget):
+    if not PRIVATE_KEY_FILE.exists():
+        QMessageBox.critical(parent, "No private key",
+                             f"{PRIVATE_KEY_FILE.name} not found.\nRun: python generate_keys.py")
+        return None
+    pem = PRIVATE_KEY_FILE.read_bytes()
+    try:
+        return load_private_key(pem)
+    except TypeError:          # the key is encrypted: ask for the passphrase
+        pass
+    while True:
+        passphrase, ok = QInputDialog.getText(parent, "Private key", "Passphrase:", QLineEdit.Password)
+        if not ok:
+            return None
+        try:
+            return load_private_key(pem, passphrase.encode())
+        except (ValueError, TypeError):
+            QMessageBox.warning(parent, "Private key", "Wrong passphrase.")
+
 
 class KeyGeneratorApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.private_key = None
         self.init_ui()
-        
+
     def init_ui(self):
-        self.setWindowTitle('License Key Generator')
-        self.setFixedSize(600, 600)
-        
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
+        self.setWindowTitle("License Key Generator (vendor)")
+        self.resize(640, 520)
+        font, mono = QFont("Arial", 11), QFont("Consolas", 11)
+
         layout = QVBoxLayout()
-        
-        hwid_label = QLabel('Paste Hardware ID here:')
-        hwid_label.setFont(QFont('Arial', 12))
-        layout.addWidget(hwid_label)
-        
-        self.hwid_input = QTextEdit()
-        self.hwid_input.setFont(QFont('Courier', 14))
-        self.hwid_input.setFixedHeight(70)
+        layout.addWidget(QLabel("Customer's Hardware ID:", font=font))
+        self.hwid_input = QLineEdit(font=mono)
+        self.hwid_input.setPlaceholderText("1A2B3C4D-5E6F7A8B-9C0D1E2F-3A4B5C6D")
         layout.addWidget(self.hwid_input)
-        
-        days_layout = QHBoxLayout()
-        
-        days_label = QLabel('Number of days:')
-        days_label.setFont(QFont('Arial', 12))
-        days_layout.addWidget(days_label)
-        
-        self.days_input = QSpinBox()
-        self.days_input.setFont(QFont('Arial', 12))
-        self.days_input.setMinimum(1)
-        self.days_input.setMaximum(365)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Days:", font=font))
+        self.days_input = QSpinBox(font=font)
+        self.days_input.setRange(1, MAX_DAYS)
         self.days_input.setValue(30)
-        days_layout.addWidget(self.days_input)
-        
-        layout.addLayout(days_layout)
-        
-        generate_btn = QPushButton('Generate License Key')
-        generate_btn.setFont(QFont('Arial', 12))
+        row.addWidget(self.days_input)
+        row.addStretch()
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        self.extend_check = QCheckBox("Extend from the current expiry date:", font=font)
+        self.extend_date = QDateEdit(QDate.currentDate(), font=font)
+        self.extend_date.setCalendarPopup(True)
+        self.extend_date.setDisplayFormat("yyyy-MM-dd")
+        self.extend_date.setEnabled(False)
+        self.extend_check.toggled.connect(self.extend_date.setEnabled)
+        row.addWidget(self.extend_check)
+        row.addWidget(self.extend_date)
+        row.addStretch()
+        layout.addLayout(row)
+
+        generate_btn = QPushButton("Generate License Key", font=font)
         generate_btn.clicked.connect(self.generate_key)
         layout.addWidget(generate_btn)
-        
-        key_label = QLabel('Generated License Key (Click to select all):')
-        key_label.setFont(QFont('Arial', 12))
-        layout.addWidget(key_label)
-        
-        self.key_output = QTextEdit()
-        self.key_output.setFont(QFont('Courier', 14))
-        self.key_output.setFixedHeight(70)
-        self.key_output.setReadOnly(True)
-        layout.addWidget(self.key_output)
-        
-        self.key_info = QTextEdit()
-        self.key_info.setFont(QFont('Arial', 11))
-        self.key_info.setFixedHeight(100)
-        self.key_info.setReadOnly(True)
-        layout.addWidget(self.key_info)
-        
-        main_widget.setLayout(layout)
-        
-    def generate_key(self):
-        hwid = self.hwid_input.toPlainText().strip()
-        days = self.days_input.value()
-        
-        if not hwid:
-            QMessageBox.warning(self, 'Warning', 'Please paste the Hardware ID first!')
-            return
-        
-        secret = "YourSecretKeyHere"  # Trebuie să fie aceeași cu cea din security_system.py
-        current_date = datetime.now().strftime('%Y-%m-%d')
-        
-        key_base = f"{hwid}:{current_date}:{days}:{secret}"
-        license_key = hashlib.sha256(key_base.encode()).hexdigest()[:32]
-        
-        self.key_output.setPlainText(license_key)
-        
-        expiry_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d')
-        info_text = f"Key Information:\n"
-        info_text += f"• Valid for: {days} days\n"
-        info_text += f"• Generated on: {current_date}\n"
-        info_text += f"• Expires on: {expiry_date}\n"
-        info_text += f"• Hardware ID: {hwid}"
-        
-        self.key_info.setPlainText(info_text)
-        
-        self.key_output.selectAll()
-        
-        QMessageBox.information(self, 'Success', f'License key generated successfully!\nKey is valid for {days} days.')
 
-if __name__ == '__main__':
+        layout.addWidget(QLabel("License key (send this to the customer):", font=font))
+        self.key_output = QTextEdit(font=mono, readOnly=True)
+        self.key_output.setFixedHeight(90)
+        layout.addWidget(self.key_output)
+
+        copy_btn = QPushButton("Copy key", font=font)
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(self.key_output.toPlainText()))
+        layout.addWidget(copy_btn)
+
+        self.key_info = QTextEdit(font=font, readOnly=True)
+        self.key_info.setFixedHeight(110)
+        layout.addWidget(self.key_info)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+    def generate_key(self):
+        if self.private_key is None:
+            self.private_key = load_vendor_key(self)
+            if self.private_key is None:
+                return
+        start = None
+        if self.extend_check.isChecked():
+            start = self.extend_date.date().toPyDate()
+        try:
+            key = issue_license(self.private_key, self.hwid_input.text(), self.days_input.value(), start=start)
+        except LicenseError as exc:
+            QMessageBox.warning(self, "Cannot generate", str(exc))
+            return
+
+        lic = read_license(key, self.private_key.public_key())
+        self.key_output.setPlainText(key)
+        self.key_info.setPlainText(
+            f"Hardware ID:  {lic.hardware_id}\n"
+            f"Issued on:    {lic.issued.isoformat()}\n"
+            f"Expires on:   {lic.expires.isoformat()}  ({lic.days_left(date.today())} days from today)\n"
+            f"License ID:   {lic.license_id}"
+        )
+
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = KeyGeneratorApp()
     window.show()

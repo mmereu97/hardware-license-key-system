@@ -1,200 +1,130 @@
-# Hardware-Based License Key Protection System
+# 🔐 Hardware-Bound License Keys
 
-## Overview
+**Offline software licensing in Python with Ed25519 signatures.**
+The vendor signs licenses with a private key; the application verifies them with an embedded public key. Licenses are bound to the customer's hardware, expire on a fixed date, can be extended without reinstalling, and survive restarts, Windows updates and a replaced disk.
 
-This repository contains a robust license key protection system designed for software applications. It implements hardware fingerprinting, secure encryption, and time verification to create a reliable licensing mechanism that protects your software from unauthorized use.
+Reading the application's code or unpacking its `.exe` does **not** let anyone generate keys: the private key never leaves the vendor.
 
-The system consists of three main components:
-- **Key Generator**: Creates unique license keys based on hardware ID
-- **Security System**: Manages hardware fingerprinting, encryption, and license verification
-- **Application Example**: Demonstrates how to integrate the protection system (WordReplacer)
+**Tech:** Python · cryptography (Ed25519) · PyQt5 · WMI · NTP · unittest
 
-## Protection Mechanisms
+---
 
-> **Note**: One of the most important security measures is replacing the placeholder `"YourSecretKeyHere"` with your own unique secret key before distribution. This is explained in detail in the [Secret Key Configuration](#secret-key-configuration) section.
+## How it works
 
-The system implements multiple layers of security to protect your software:
-
-1. **Hardware Fingerprinting**
-   - CPU identification (ProcessorId, Name, NumberOfCores)
-   - BIOS information (Manufacturer, SerialNumber, Version)
-   - Motherboard details (Manufacturer, Product, SerialNumber)
-   - Disk drive information (Model, SerialNumber)
-   - MAC address of the network adapter
-   - Operating system platform information
-
-2. **Cryptographic Protection**
-   - RSA-2048 asymmetric encryption for key security
-   - AES-256 symmetric encryption for license data
-   - SHA-256 hashing for hardware fingerprint generation
-   - PKCS7 padding for secure data handling
-   - Base64 encoding with random noise for string obfuscation
-
-3. **Anti-Tampering Measures**
-   - NTP time verification against multiple servers (pool.ntp.org, time.google.com, etc.)
-   - System time manipulation detection with 5-minute tolerance threshold
-   - XOR operations with device-specific keys for additional encryption
-   - Hardware component verification requiring at least 2 matching components
-
-4. **License Management**
-   - Time-limited licenses with configurable duration (1-365 days)
-   - License expiration based on activation date
-   - Secure storage of license data in encrypted format
-   - License extension capability without reinstallation
-   - Last verification timestamp tracking
-
-5. **Implementation Security**
-   - Secret key integration in validation algorithm
-   - Exception handling to prevent information leakage
-   - Randomized server selection for time verification
-   - Hardware tolerance allowing for minor system changes
-   - Encrypted on-disk license storage
-
-## Components
-
-### 1. Key Generator (`keygen.py`)
-
-A standalone application for generating license keys based on:
-- Hardware ID
-- License duration (in days)
-- Current date
-- Secret key
-
-![Key Generator Screenshot](key_generator_screenshot.png)
-
-### 2. Security System (`security_system.py`)
-
-The core security module provides:
-
-- **EnhancedHardwareID**: Collects hardware information to create a unique device fingerprint
-- **SecurityModule**: Handles encryption, time verification, and other security features
-- **SecureLicenseManager**: Manages license validation, storage, and verification
-
-### 3. Application Example (`word_replacer.py`)
-
-Demonstrates integration with an actual application:
-- License validation on startup
-- Technical dialog for license information and renewal
-- Activation dialog for new installations
-
-## How It Works
-
-1. **Hardware ID Generation**:
-   - Collects information from CPU, BIOS, motherboard, disk, MAC address, and OS
-   - Creates a unique fingerprint hash for the device
-
-2. **License Creation**:
-   - Administrator uses KeyGenerator to create a license key based on user's Hardware ID
-   - Key incorporates the hardware ID, current date, validity period, and secret key
-
-3. **License Activation**:
-   - User enters the license key in the application
-   - System verifies the key against the hardware
-   - License data is encrypted and stored securely
-
-4. **Ongoing Verification**:
-   - Application checks license validity at startup and during operations
-   - Verifies system time against NTP servers to prevent tampering
-   - Confirms hardware matches the original activation hardware
-
-## Integration Guide
-
-### Prerequisites
-
-- Python 3.6 or higher
-- Required packages: PyQt5, cryptography, ntplib, wmi, python-docx
-
-### Installation
-
-```bash
-pip install PyQt5 cryptography ntplib wmi python-docx
+```
+ Customer's PC                                    Vendor
+ ─────────────                                    ──────
+ Application shows the Hardware ID   ──────────►  keygen.py
+   7520B5A1-3F09C2D4-37C20EDF-A81B6E50              signs {hardware ID, issue date, expiry}
+                                                    with the PRIVATE key
+ Customer pastes the license key     ◄──────────  eyJleHAiOiIyMDI2LTEy....Zk3Nq
+   application verifies it with the
+   embedded PUBLIC key, checks the
+   hardware and the date
 ```
 
-### Integrating with Your Application
+A license key is `<payload>.<signature>` in base64url. The payload is small, readable JSON:
 
-1. **Include the Security System**:
-   ```python
-   from security_system import SecureLicenseManager
-   ```
+```json
+{"v":1,"hw":"7520B5A1-3F09C2D4-37C20EDF-A81B6E50","iss":"2026-10-29","exp":"2026-12-13","id":"21baa3be"}
+```
 
-2. **Initialize License Manager**:
-   ```python
-   license_manager = SecureLicenseManager()
-   ```
+Change a single character and the Ed25519 signature no longer matches.
 
-3. **Verify License on Startup**:
-   ```python
-   is_valid, message = license_manager.verify_license()
-   if not is_valid:
-       # Show activation dialog or exit
-   ```
+### Hardware ID
 
-4. **Check License Before Critical Operations**:
-   ```python
-   def important_function():
-       is_valid, message = license_manager.verify_license()
-       if not is_valid:
-           # Handle unlicensed state
-           return False
-       # Proceed with function
-   ```
+Four 8-character hashes, one per component: **CPU · BIOS · motherboard · system disk** (read through WMI on Windows).
 
-### Secret Key Configuration
+- **One component may change** (e.g. a new disk): at least 3 of 4 must still match.
+- Components with placeholder serials (`To be filled by O.E.M.`, `Default string`) count as unreadable and never as a match.
+- Deliberately **not** used because they change while the computer stays the same: MAC address (VPNs, docks), Windows build number (updates), computer name, BIOS version (firmware updates).
 
-**CRITICAL SECURITY STEP**: 
-Before deploying the system, you **MUST** replace the placeholder text `"YourSecretKeyHere"` with your own secret key in **both** files:
-- In `keygen.py` (line 70): `secret = "YourSecretKeyHere"`
-- In `security_system.py` (line 385): `key_base = f"{hwid}:{current_date}:{days}:YourSecretKeyHere"`
+### Protection against clock tampering
 
-This secret key is fundamental to the security of the entire system:
-- It's incorporated into the license key generation algorithm
-- It prevents unauthorized key generation
-- It ensures that licenses created with one secret key cannot be used with applications using a different secret key
-- Without changing this value, your application will be vulnerable to unauthorized license generation
+- A license is refused if the system date is **earlier than its issue date**.
+- The application remembers the last time it saw the clock (in a sealed state file) and refuses to run if the clock **moves back** more than 10 minutes.
+- When online, the clock is compared with NTP servers (5-minute tolerance, checked at most once per hour). Offline use keeps working.
 
-For maximum security, use a strong, random string of at least a 32-character mix of uppercase, lowercase, numbers, and special characters.
+### Extending a license
 
-## Security Considerations
+The vendor ticks *Extend from the current expiry date* in the generator, so the new days are added after the old expiry. The application keeps every valid key and uses the one that lasts longest.
 
-- The secret key should be strong and kept confidential
-- Consider obfuscating the source code before distribution
-- The license validation relies on hardware components that may change if users upgrade their systems
-- The system requires internet access for NTP time verification
+---
 
-## Limitations
+## Project structure
 
-- Hardware upgrades may invalidate licenses (system allows for some flexibility)
-- Requires proper error handling for systems without internet access
-- Advanced users might attempt to reverse-engineer the protection
+| File | Role | Ships to customers? |
+|---|---|---|
+| `license_core.py` | Pure logic: hardware ID format, signing, verification, rules. No Qt, no Windows, no I/O | ✅ |
+| `hardware_id.py` | Reads the hardware components (WMI on Windows, fallback elsewhere) | ✅ |
+| `security_system.py` | `SecureLicenseManager`: what the application calls | ✅ |
+| `public_key.py` | The vendor's public key, embedded in the code | ✅ |
+| `word_replacer.py` | Example protected application (replaces a word in `.docx` files) | ✅ |
+| `generate_keys.py` | One-time setup: creates the key pair | ❌ vendor only |
+| `keygen.py` | GUI license generator | ❌ vendor only |
+| `vendor_private_key.pem` | The private key (git-ignored, optionally passphrase-encrypted) | ❌ **never** |
+| `test_license.py` | 27 unit tests | ❌ |
 
-## License Extension Process
+---
 
-1. User provides their Hardware ID from the Technical dialog
-2. Administrator generates a new key using the KeyGenerator
-3. User enters the new key in the Technical dialog
-4. The system adds the new license duration to the remaining time
+## Getting started
 
-## Example Application: Word Replacer
+```bash
+pip install -r requirements.txt
 
-The included Word Replacer application demonstrates how to implement the licensing system:
+python generate_keys.py      # 1. once: creates vendor_private_key.pem and public_key.py
+python word_replacer.py      # 2. the app shows its Hardware ID and asks for a key
+python keygen.py             # 3. paste the Hardware ID, choose the days, copy the key
+python -m unittest -v test_license
+```
 
-- It processes Word documents in a selected folder
-- Replaces specific text in documents that start with "@@" prefix
-- Includes license activation and technical dialogs
-- Shows days remaining and hardware ID information
+### Integrating into your own application
 
-This example is provided only to demonstrate the integration of the licensing system and can be replaced with your own application logic.
+```python
+from security_system import SecureLicenseManager
 
-## Troubleshooting
+license_manager = SecureLicenseManager()
 
-- **License Invalid After Hardware Change**: If major hardware components are changed, a new license key will be required
-- **Time Verification Failures**: Ensure the system has internet access for NTP verification
-- **Activation Issues**: Verify the correct Hardware ID is being used for key generation
+status = license_manager.status()        # LicenseStatus(valid, message, days_left, expires)
+if not status.valid:
+    print(status.message)                # e.g. "License expired on 2026-12-13"
+    print(license_manager.get_hardware_id())
+    ok, message = license_manager.save_license(input("License key: "))
+```
 
-## Contributing
+---
 
-Contributions to improve the security system are welcome. Please feel free to submit pull requests or open issues for discussion.
+## Tests
 
-## Disclaimer
+`test_license.py` runs anywhere (no Windows, no Qt, no network): keys, hardware IDs and the clock are injected.
 
-This licensing system provides a reasonable level of protection but cannot guarantee complete security against determined attackers. Always consider additional protection measures for highly sensitive applications.
+It covers: signature round-trip, keys from another vendor, edited payloads, malformed keys, hardware tolerance (1 change accepted, 2 rejected), placeholder serials, expiry, clock earlier than issue date, clock moved back, small clock adjustments, extension, **surviving an application restart**, tampering with the state file, and encrypted private keys.
+
+---
+
+## Why version 2: what I found in my own v1
+
+Version 1 ([tag `v1-legacy`](https://github.com/mmereu97/hardware-license-key-system/tree/v1-legacy)) looked secure on paper (RSA-2048, AES-256, SHA-256, NTP) but a review showed the cryptography was protecting the wrong things:
+
+| v1 | Problem | v2 |
+|---|---|---|
+| Key = `sha256(hardware ID : date : days : secret)` | The secret had to be inside the application, so anyone who unpacked the `.exe` could generate licenses | Ed25519 signatures: the application only has the public key |
+| RSA key generated at each start (later saved in `rsa_key.dat` next to `license.dat`) | First the license did not survive a restart; then the decryption key sat next to the encrypted file, so the license could be decrypted, edited and re-encrypted | Nothing secret is stored on the client; the license itself is signed and cannot be edited |
+| `eval()` on the decrypted license data | Arbitrary code execution from a data file | Plain JSON |
+| Device key from computer name and Windows version | A Windows update or renaming the PC broke the license | Stable components only, 3 of 4 must match |
+| A key was valid only on the day it was generated | A customer activating the next day got "invalid key" | Explicit issue and expiry dates in the signed payload |
+| NTP required | No internet = no application | NTP when available, plus local clock rollback detection |
+
+---
+
+## Security model, honestly
+
+This makes **forging a license** infeasible without the private key. It does not, and no offline scheme can, stop a determined attacker from **patching the license check out of the binary**. For that, add code obfuscation or compilation (e.g. Nuitka instead of PyInstaller), or move value to a server the application needs.
+
+Keep `vendor_private_key.pem` backed up and offline, protect it with a passphrase, and never commit it (`.gitignore` already excludes `*.pem`).
+
+---
+
+## Author
+
+Mihai Mereu · [GitHub](https://github.com/mmereu97)
